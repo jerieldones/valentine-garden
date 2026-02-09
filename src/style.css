@@ -93,4 +93,28 @@ button {
   background: #120015;
 }
 
-#fallback.show { display: grid; }
+#loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: white;
+  text-align: center;
+  padding: 20px;
+  background: radial-gradient(1200px 700px at 50% 30%, rgba(255, 154, 118, 0.20), transparent 60%),
+              linear-gradient(#120015, #082a24);
+  z-index: 5;
+  opacity: 1;
+  transition: opacity 450ms ease;
+  pointer-events: none;
+}
+
+#loading.hide {
+  opacity: 0;
+}
+
+/* If WebGL fails or code crashes, show fallback (already in your CSS) */
+#fallback.show {
+  display: grid;
+  z-index: 6;
+}
