@@ -111,6 +111,7 @@ const pick = (arr) => arr[Math.floor(rng() * arr.length)];
 // Boot
 // --------------------
 init();
+console.log('WebGL supported?', hasWebGL());
 
 function init() {
   if (!hasWebGL()) {
