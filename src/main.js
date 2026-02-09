@@ -49,8 +49,8 @@ const CONFIG = {
   seed: 20260214,
   maxPixelRatio: 2,
 
-  flowerCount: isMobile() ? 1400 : 4500,
-  fieldRadius: 55,
+  flowerCount: isMobile() ? 9000 : 10000,
+  fieldRadius: 120,
   clearRadius: 12.0,
 
   cameraPos: new THREE.Vector3(0, 3.5, 12.0),
@@ -59,10 +59,17 @@ const CONFIG = {
   enableControls: true,
   enableWind: true,
 
-  roseHeight: 3.5,
+  roseHeight: 5.0,
   rosePosition: new THREE.Vector3(0, 0, 0),
 
   tapCooldownMs: 900,
+
+  heartCount: isMobile() ? 200 : 400,
+  heartFallSpeedMin: -0.5,
+  heartFallSpeedMax: -1.2,
+  heartStartYMin: 10,
+  heartStartYMax: 20,
+  heartScale: 0.4,
 };
 
 // --------------------
@@ -83,6 +90,7 @@ let clock;
 let raycaster, pointerNDC;
 let flowerField = null;
 let rose = null;
+let fallingHearts = null;
 let lastTapTime = -Infinity;
 let triggered = false;
 
@@ -108,6 +116,178 @@ const rand = (min, max) => min + rng() * (max - min);
 const pick = (arr) => arr[Math.floor(rng() * arr.length)];
 
 // --------------------
+// New: Leaflet Geometry for Realistic Serrated Leaflet
+// --------------------
+function createLeafletGeometry(length = 0.15, width = 0.07, numTeeth = 6) {
+  const shape = new THREE.Shape();
+  const halfWidth = width / 2;
+  const toothDepth = 0.008;
+
+  // Left side points (base to tip)
+  const leftPoints = [new THREE.Vector2(0, 0)];
+  for (let i = 1; i < numTeeth; i++) {
+    const t = i / numTeeth;
+    const y = t * length;
+    const w = halfWidth * Math.sin(Math.PI * t);
+    leftPoints.push(new THREE.Vector2(-w, y));
+
+    const tt = (i - 0.5) / numTeeth;
+    const ty = tt * length;
+    const tw = halfWidth * Math.sin(Math.PI * tt);
+    leftPoints.push(new THREE.Vector2(-tw - toothDepth, ty));
+  }
+  leftPoints.push(new THREE.Vector2(0, length));
+
+  // Right side points (tip to base, mirrored)
+  const rightPoints = [];
+  for (let i = 0; i < leftPoints.length; i++) {
+    const p = leftPoints[leftPoints.length - 1 - i].clone();
+    p.x = -p.x;
+    rightPoints.push(p);
+  }
+
+  // Combine points
+  const allPoints = leftPoints.concat(rightPoints.slice(1)); // Avoid duplicate base
+
+  // Build shape
+  shape.moveTo(allPoints[0].x, allPoints[0].y);
+  for (let i = 1; i < allPoints.length; i++) {
+    shape.lineTo(allPoints[i].x, allPoints[i].y);
+  }
+
+  const geo = new THREE.ShapeGeometry(shape, 8); // Curve segments for smooth edges
+
+  // Add slight curvature for realism
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const curve = Math.sin((y / length) * Math.PI) * x * 1.2; // Bend along length
+    pos.setZ(i, curve);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+
+  return geo;
+}
+
+// --------------------
+// New: Compound Leaf Geometry (Petiole + Leaflets)
+// --------------------
+function createCompoundLeafGeo(basePosition, baseRotation, petioleLength = 0.1, leafletLength = 0.15, leafletWidth = 0.07, numTeeth = 8) {
+  const geos = [];
+
+  // Petiole (small stem)
+  const petioleGeo = new THREE.CylinderGeometry(0.008, 0.012, petioleLength, 8);
+  petioleGeo.translate(0, petioleLength / 2, 0);
+  geos.push(petioleGeo);
+
+  // Base leaflet geometry
+  const leafletGeo = createLeafletGeometry(leafletLength, leafletWidth, numTeeth);
+
+  // Terminal leaflet (straight)
+  const terminal = leafletGeo.clone();
+  terminal.translate(0, petioleLength, 0);
+  geos.push(terminal);
+
+  // Side leaflet 1 (angled left)
+  const side1 = leafletGeo.clone();
+  side1.rotateZ(0.8); // ~45 degrees
+  side1.translate(-0.04, petioleLength * 0.6, 0);
+  geos.push(side1);
+
+  // Side leaflet 2 (angled right)
+  const side2 = leafletGeo.clone();
+  side2.rotateZ(-0.8);
+  side2.translate(0.04, petioleLength * 0.6, 0);
+  geos.push(side2);
+
+  // Merge into single geometry
+  const merged = mergeGeometries(geos);
+
+  // Apply base rotation and translation
+  if (baseRotation.y) merged.rotateY(baseRotation.y);
+  if (baseRotation.z) merged.rotateZ(baseRotation.z);
+  merged.translate(basePosition.x, basePosition.y, basePosition.z);
+
+  return merged;
+}
+
+// --------------------
+// New: Smooth Leaf Geometry for Field Flowers
+// --------------------
+function createSmoothLeafGeometry(length = 0.3, width = 0.12) {
+  const shape = new THREE.Shape();
+
+  shape.moveTo(0, 0);
+  shape.quadraticCurveTo(-width/2, length/3, -width/2, 2*length/3);
+  shape.quadraticCurveTo(-width/2, length, 0, length);
+  shape.quadraticCurveTo(width/2, length, width/2, 2*length/3);
+  shape.quadraticCurveTo(width/2, length/3, 0, 0);
+
+  const geo = new THREE.ShapeGeometry(shape, 12);
+
+  // Add curvature
+  const pos = geo.attributes.position;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const curve = Math.sin((y / length) * Math.PI) * Math.abs(x) * 1.5;
+    pos.setZ(i, curve);
+  }
+  pos.needsUpdate = true;
+  geo.computeVertexNormals();
+
+  return geo;
+}
+
+// --------------------
+// New: Petal Shape for Field Flowers
+// --------------------
+function createPetalShape() {
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 0);
+  shape.bezierCurveTo(-0.05, 0.1, -0.15, 0.25, -0.15, 0.4);
+  shape.bezierCurveTo(-0.15, 0.55, -0.05, 0.7, 0, 0.7);
+  shape.bezierCurveTo(0.05, 0.7, 0.15, 0.55, 0.15, 0.4);
+  shape.bezierCurveTo(0.15, 0.25, 0.05, 0.1, 0, 0);
+  return shape;
+}
+
+// --------------------
+// New: Heart Shape Geometry
+// --------------------
+function createHeartGeometry(size = 1) {
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 0.25 * size);
+  shape.bezierCurveTo(0, 0.375 * size, 0.125 * size, 0.5 * size, 0.25 * size, 0.5 * size);
+  shape.bezierCurveTo(0.375 * size, 0.5 * size, 0.5 * size, 0.375 * size, 0.5 * size, 0.25 * size);
+  shape.bezierCurveTo(0.5 * size, 0.125 * size, 0.4375 * size, 0, 0.375 * size, 0);
+  shape.bezierCurveTo(0.3125 * size, 0, 0.25 * size, 0.0625 * size, 0.25 * size, 0.125 * size);
+  shape.bezierCurveTo(0.25 * size, 0.1875 * size, 0.1875 * size, 0.25 * size, 0.125 * size, 0.25 * size);
+  shape.bezierCurveTo(0.0625 * size, 0.25 * size, 0, 0.1875 * size, 0, 0.125 * size);
+  shape.bezierCurveTo(0, 0.0625 * size, -0.0625 * size, 0, -0.125 * size, 0);
+  shape.bezierCurveTo(-0.1875 * size, 0, -0.25 * size, 0.0625 * size, -0.25 * size, 0.125 * size);
+  shape.bezierCurveTo(-0.25 * size, 0.1875 * size, -0.3125 * size, 0.25 * size, -0.375 * size, 0.25 * size);
+  shape.bezierCurveTo(-0.4375 * size, 0.25 * size, -0.5 * size, 0.1875 * size, -0.5 * size, 0.125 * size);
+  shape.bezierCurveTo(-0.5 * size, 0.0625 * size, -0.4375 * size, 0, -0.375 * size, 0);
+  shape.bezierCurveTo(-0.3125 * size, 0, -0.25 * size, -0.0625 * size, -0.25 * size, -0.125 * size);
+  shape.bezierCurveTo(-0.25 * size, -0.1875 * size, -0.1875 * size, -0.25 * size, -0.125 * size, -0.25 * size);
+  shape.bezierCurveTo(-0.0625 * size, -0.25 * size, 0, -0.1875 * size, 0, -0.125 * size);
+  shape.bezierCurveTo(0, -0.0625 * size, 0.0625 * size, 0, 0.125 * size, 0);
+  shape.bezierCurveTo(0.1875 * size, 0, 0.25 * size, -0.0625 * size, 0.25 * size, -0.125 * size);
+  shape.bezierCurveTo(0.25 * size, -0.1875 * size, 0.3125 * size, -0.25 * size, 0.375 * size, -0.25 * size);
+  shape.bezierCurveTo(0.4375 * size, -0.25 * size, 0.5 * size, -0.1875 * size, 0.5 * size, -0.125 * size);
+  shape.bezierCurveTo(0.5 * size, 0, 0.375 * size, 0.125 * size, 0.25 * size, 0.125 * size);
+  shape.bezierCurveTo(0.125 * size, 0.125 * size, 0, 0, 0, 0.25 * size);
+
+  const geo = new THREE.ShapeGeometry(shape, 16);
+  geo.rotateX(Math.PI); // Face camera if needed
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// --------------------
 // Boot
 // --------------------
 init();
@@ -124,6 +304,7 @@ function init() {
   initScene();
   flowerField = createFlowerField();
   rose = createRose();
+  fallingHearts = createFallingHearts();
 
   setupInteraction();
   setupButtons();
@@ -521,6 +702,7 @@ function createFlowerField() {
     roughness: 0.70,
     metalness: 0.05,
     vertexColors: true,
+    side: THREE.DoubleSide,
   });
 
   const mesh = new THREE.InstancedMesh(flowerGeo, flowerMat, CONFIG.flowerCount);
@@ -603,34 +785,47 @@ function buildSingleFlowerGeometry() {
   const stem = new THREE.CylinderGeometry(0.035, 0.055, 1.5, 8);
   stem.translate(0, 0.75, 0);
 
-  const leaf1 = new THREE.SphereGeometry(0.28, 14, 12, 0, Math.PI, 0, Math.PI);
-  leaf1.scale(2.0, 0.60, 1.1);
+  const leafGeo = createSmoothLeafGeometry(0.4, 0.18);
+
+  const leaf1 = leafGeo.clone();
   leaf1.rotateZ(-0.65);
   leaf1.translate(0.20, 0.60, 0.06);
 
-  const leaf2 = new THREE.SphereGeometry(0.26, 14, 12, 0, Math.PI, 0, Math.PI);
-  leaf2.scale(1.85, 0.55, 1.0);
+  const leaf2 = leafGeo.clone();
   leaf2.rotateZ(0.65);
   leaf2.rotateY(Math.PI * 0.7);
   leaf2.translate(-0.18, 0.75, -0.04);
 
+  const petalShape = createPetalShape();
+  const singlePetalGeo = new THREE.ShapeGeometry(petalShape, 16);
+
+  // Add curvature to petals
+  const petalLength = 0.7;
+  const petalPos = singlePetalGeo.attributes.position;
+  for (let i = 0; i < petalPos.count; i++) {
+    const x = petalPos.getX(i);
+    const y = petalPos.getY(i);
+    const curve = Math.sin((y / petalLength) * Math.PI) * Math.abs(x) * 1.5;
+    petalPos.setZ(i, curve);
+  }
+  petalPos.needsUpdate = true;
+  singlePetalGeo.computeVertexNormals();
+
   const petals = [];
-  const petalCount = 9;
-  for (let i = 0; i < petalCount; i++) {
-    const petal = new THREE.ConeGeometry(0.16, 0.38, 8);
-    petal.scale(1.1, 1.0, 0.60);
-    petal.rotateX(Math.PI);
-
-    const angle = (i / petalCount) * Math.PI * 2;
-    const radiusVar = 0.16 + (i % 2) * 0.02;
-    
-    const m = new THREE.Matrix4()
-      .makeRotationY(angle)
-      .multiply(new THREE.Matrix4().makeRotationX(0.60 + (i % 3) * 0.05))
-      .multiply(new THREE.Matrix4().makeTranslation(0, 1.55, radiusVar));
-
-    petal.applyMatrix4(m);
-    petals.push(petal);
+  const layers = [
+    { count: 6, size: 0.8, out: 0.5, radius: 0.1 },
+    { count: 8, size: 1.0, out: 0.65, radius: 0 }
+  ];
+  for (let layer of layers) {
+    for (let i = 0; i < layer.count; i++) {
+      const angle = (i / layer.count) * Math.PI * 2 + rng() * 0.1;
+      const petal = singlePetalGeo.clone();
+      petal.scale(layer.size, layer.size, layer.size);
+      petal.rotateY(angle);
+      petal.rotateX(layer.out);
+      petal.translate(0, 1.55, layer.radius);
+      petals.push(petal);
+    }
   }
 
   const center = new THREE.SphereGeometry(0.12, 14, 12);
@@ -692,8 +887,88 @@ function applyWindShader(instancedMesh) {
          float topBend = smoothstep(1.2, 1.6, transformed.y);
          transformed.x += sin(t * 1.3) * 0.08 * topBend * aSway;`
       );
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        'diffuseColor.rgb *= vInstanceColor;',
+        'if (vColor.r > 0.9 && vColor.g > 0.9 && vColor.b > 0.9) { diffuseColor.rgb *= vInstanceColor; }'
+      );
   };
   mat.needsUpdate = true;
+}
+
+// --------------------
+// Falling Hearts
+// --------------------
+function createFallingHearts() {
+  const heartGeo = createHeartGeometry(1);
+  const heartMat = new THREE.MeshBasicMaterial({
+    color: 0xff1744,
+    side: THREE.DoubleSide,
+    transparent: true,
+    opacity: 0.8,
+    blending: THREE.AdditiveBlending,
+  });
+
+  const mesh = new THREE.InstancedMesh(heartGeo, heartMat, CONFIG.heartCount);
+  mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+  const positions = [];
+  const velocities = [];
+  const phases = [];
+  const tmpM = new THREE.Matrix4();
+  const tmpQ = new THREE.Quaternion();
+  const tmpS = new THREE.Vector3(1, 1, 1);
+  const tmpP = new THREE.Vector3();
+
+  for (let i = 0; i < CONFIG.heartCount; i++) {
+    const r = rand(0, CONFIG.fieldRadius * 1.2);
+    const a = rand(0, Math.PI * 2);
+    const x = Math.cos(a) * r;
+    const z = Math.sin(a) * r;
+    const y = rand(CONFIG.heartStartYMin, CONFIG.heartStartYMax);
+
+    tmpP.set(x, y, z);
+    tmpQ.setFromEuler(new THREE.Euler(rand(0, Math.PI), rand(0, Math.PI * 2), rand(0, Math.PI)));
+    tmpS.setScalar(CONFIG.heartScale * rand(0.5, 1.5));
+
+    tmpM.compose(tmpP, tmpQ, tmpS);
+    mesh.setMatrixAt(i, tmpM);
+
+    positions.push(new THREE.Vector3(x, y, z));
+    velocities.push(rand(CONFIG.heartFallSpeedMin, CONFIG.heartFallSpeedMax));
+    phases.push(rand(0, Math.PI * 2));
+  }
+
+  mesh.instanceMatrix.needsUpdate = true;
+  scene.add(mesh);
+
+  const update = (delta, t) => {
+    for (let i = 0; i < CONFIG.heartCount; i++) {
+      const pos = positions[i];
+      pos.y += velocities[i] * delta;
+
+      const swayX = Math.sin(t + phases[i]) * 0.5;
+      const swayZ = Math.cos(t + phases[i] * 0.7) * 0.3;
+      pos.x += swayX * delta;
+      pos.z += swayZ * delta;
+
+      if (pos.y < 0) {
+        const r = rand(0, CONFIG.fieldRadius * 1.2);
+        const a = rand(0, Math.PI * 2);
+        pos.x = Math.cos(a) * r;
+        pos.z = Math.sin(a) * r;
+        pos.y = rand(CONFIG.heartStartYMin, CONFIG.heartStartYMax);
+        velocities[i] = rand(CONFIG.heartFallSpeedMin, CONFIG.heartFallSpeedMax);
+      }
+
+      tmpM.compose(pos, tmpQ, tmpS);
+      mesh.setMatrixAt(i, tmpM);
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+  };
+
+  return { mesh, update };
 }
 
 // --------------------
@@ -708,10 +983,8 @@ function createRose() {
     roughness: 0.85,
     metalness: 0.0,
   });
-  const stemGeo = new THREE.CylinderGeometry(0.035, 0.045, 0.65, 12);
-  stemGeo.translate(0, 0.325, 0);
 
-  const stemMesh = new THREE.Mesh(stemGeo, stemMat);
+  const stemMesh = createRealRoseStemMesh(stemMat);
   stemMesh.name = 'RoseStem';
   roseGroup.add(stemMesh);
 
@@ -720,23 +993,7 @@ function createRose() {
     roughness: 0.70,
     metalness: 0.0,
   });
-  
-  for (let i = 0; i < 5; i++) {
-    const thornGeo = new THREE.ConeGeometry(0.015, 0.04, 6);
-    thornGeo.rotateX(Math.PI / 2);
-    
-    const angle = (i / 5) * Math.PI * 2 + (i * 0.5);
-    const height = 0.15 + (i * 0.08);
-    
-    thornGeo.translate(
-      Math.cos(angle) * 0.038,
-      height,
-      Math.sin(angle) * 0.038
-    );
-    
-    const thornMesh = new THREE.Mesh(thornGeo, thornMat);
-    roseGroup.add(thornMesh);
-  }
+  addThornsToStem(roseGroup, stemMesh, thornMat);
 
   const leafMat = new THREE.MeshStandardMaterial({
     color: 0x1a7a45,
@@ -745,22 +1002,24 @@ function createRose() {
     side: THREE.DoubleSide,
   });
 
-  const leaf1 = new THREE.SphereGeometry(0.08, 12, 10, 0, Math.PI, 0, Math.PI);
-  leaf1.scale(2.4, 0.60, 1.3);
-  leaf1.rotateZ(-0.9);
-  leaf1.translate(0.08, 0.28, 0.03);
+  // Create compound leaves
+  const leaf1 = createCompoundLeafGeo(
+    new THREE.Vector3(0.08, 0.28, 0.03),
+    new THREE.Euler(0, 0, -0.9),
+    0.1, 0.15, 0.07, 8
+  );
 
-  const leaf2 = new THREE.SphereGeometry(0.075, 12, 10, 0, Math.PI, 0, Math.PI);
-  leaf2.scale(2.2, 0.55, 1.2);
-  leaf2.rotateZ(0.85);
-  leaf2.rotateY(Math.PI);
-  leaf2.translate(-0.075, 0.38, -0.025);
+  const leaf2 = createCompoundLeafGeo(
+    new THREE.Vector3(-0.075, 0.38, -0.025),
+    new THREE.Euler(0, Math.PI, 0.85),
+    0.1, 0.14, 0.065, 8
+  );
 
-  const leaf3 = new THREE.SphereGeometry(0.07, 12, 10, 0, Math.PI, 0, Math.PI);
-  leaf3.scale(2.0, 0.50, 1.1);
-  leaf3.rotateZ(-0.7);
-  leaf3.rotateY(Math.PI * 0.5);
-  leaf3.translate(0.02, 0.45, 0.08);
+  const leaf3 = createCompoundLeafGeo(
+    new THREE.Vector3(0.02, 0.45, 0.08),
+    new THREE.Euler(0, Math.PI * 0.5, -0.7),
+    0.1, 0.13, 0.06, 7
+  );
 
   const leavesGeo = mergeGeometries([leaf1, leaf2, leaf3], false);
   leavesGeo.computeVertexNormals();
@@ -819,11 +1078,6 @@ function createRose() {
   const baseRot = roseGroup.rotation.clone();
   const baseScale = roseGroup.scale.clone();
 
-  let popAnim = null;
-  function pop() {
-    popAnim = { start: performance.now(), duration: 520 };
-  }
-
   function animateRose(t) {
     const sway = Math.sin(t * 0.85) * 0.055;
     const swayZ = Math.cos(t * 0.65) * 0.028;
@@ -836,147 +1090,214 @@ function createRose() {
       baseScale.y * (1.0 + Math.sin(t * 1.1 + 1.2) * 0.012),
       baseScale.z * breath
     );
+  }
 
-    if (popAnim) {
-      const now = performance.now();
-      const u = Math.min(1, (now - popAnim.start) / popAnim.duration);
+  return { group: roseGroup, stemMesh, leavesMesh, petalsMesh, colliderMesh, animateRose };
+}
 
-      const upPhase = 0.65;
-      const peak = 1.14;
+function createRealRoseStemMesh(stemMat) {
+  const height = 0.65;
 
-      let k = 1.0;
-      if (u < upPhase) {
-        k = lerp(1.0, peak, easeOutBack(u / upPhase));
-      } else {
-        k = lerp(peak, 1.0, easeOutCubic((u - upPhase) / (1 - upPhase)));
-      }
+  // Realistic bend (subtle S curve)
+  const p0 = new THREE.Vector3(0, 0.00, 0);
+  const p1 = new THREE.Vector3(0.06, height * 0.33, 0.02);
+  const p2 = new THREE.Vector3(-0.05, height * 0.66, -0.02);
+  const p3 = new THREE.Vector3(0.02, height * 1.00, 0.01);
 
-      roseGroup.scale.multiplyScalar(k);
+  const curve = new THREE.CatmullRomCurve3([p0, p1, p2, p3]);
 
-      if (u >= 1) popAnim = null;
+  // Create tube (we’ll taper it manually)
+  const tubularSegments = 120;
+  const radialSegments = 14;
+
+  const geo = new THREE.TubeGeometry(curve, tubularSegments, 1, radialSegments, false);
+
+  // Taper: thicker at bottom, thinner at top
+  const rBase = 0.052;
+  const rTop  = 0.028;
+
+  const pos = geo.attributes.position;
+  const ringSize = radialSegments + 1;
+  const frames = curve.computeFrenetFrames(tubularSegments, false);
+
+  const tmp = new THREE.Vector3();
+  const c = new THREE.Vector3();
+
+  for (let i = 0; i <= tubularSegments; i++) {
+    const t = i / tubularSegments;
+    const r = THREE.MathUtils.lerp(rBase, rTop, t);
+
+    c.copy(curve.getPointAt(t));
+    const n = frames.normals[i];
+    const b = frames.binormals[i];
+
+    for (let j = 0; j < ringSize; j++) {
+      const idx = i * ringSize + j;
+
+      tmp.fromBufferAttribute(pos, idx).sub(c);
+
+      // Rebuild offset in normal/binormal plane and set its length to r
+      const offN = tmp.dot(n);
+      const offB = tmp.dot(b);
+
+      const rebuilt = new THREE.Vector3()
+        .addScaledVector(n, offN)
+        .addScaledVector(b, offB);
+
+      // if numerical issues happen
+      if (rebuilt.lengthSq() < 1e-8) rebuilt.copy(n).multiplyScalar(r);
+      else rebuilt.setLength(r);
+
+      const finalPos = new THREE.Vector3().copy(c).add(rebuilt);
+      pos.setXYZ(idx, finalPos.x, finalPos.y, finalPos.z);
     }
   }
 
-  return { group: roseGroup, stemMesh, leavesMesh, petalsMesh, colliderMesh, animateRose, pop };
+  geo.computeVertexNormals();
+
+  const mesh = new THREE.Mesh(geo, stemMat);
+  mesh.userData.curve = curve;
+  mesh.userData.radiusAt = (t) => THREE.MathUtils.lerp(rBase, rTop, t);
+
+  return mesh;
+}
+
+function addThornsToStem(roseGroup, stemMesh, thornMat) {
+  const curve = stemMesh.userData.curve;
+  const radiusAt = stemMesh.userData.radiusAt;
+
+  const thornCount = 9;
+
+  const thornGeo = new THREE.ConeGeometry(0.012, 0.055, 10, 1);
+  thornGeo.rotateX(Math.PI / 2);         // point along +Z
+  thornGeo.translate(0, 0, 0.03);        // move tip outward
+
+  for (let i = 0; i < thornCount; i++) {
+    const u = i / (thornCount - 1);
+    const t = THREE.MathUtils.lerp(0.18, 0.74, u);
+
+    const p = curve.getPointAt(t);
+    const tangent = curve.getTangentAt(t).normalize();
+
+    // stable basis around tangent
+    let up = new THREE.Vector3(0, 1, 0);
+    if (Math.abs(tangent.dot(up)) > 0.9) up = new THREE.Vector3(1, 0, 0);
+
+    const normal = new THREE.Vector3().crossVectors(tangent, up).normalize();
+    const binormal = new THREE.Vector3().crossVectors(normal, tangent).normalize();
+
+    // spiral around stem for natural distribution
+    const angle = u * Math.PI * 2 * 1.8 + i * 0.45;
+    const outward = new THREE.Vector3()
+      .addScaledVector(normal, Math.cos(angle))
+      .addScaledVector(binormal, Math.sin(angle))
+      .normalize();
+
+    const r = radiusAt(t) * 0.98;
+    const thornPos = new THREE.Vector3().copy(p).addScaledVector(outward, r);
+
+    const thorn = new THREE.Mesh(thornGeo, thornMat);
+    thorn.position.copy(thornPos);
+
+    // point outward
+    thorn.lookAt(new THREE.Vector3().copy(thornPos).add(outward));
+
+    // tiny randomness for realism
+    thorn.rotateZ((Math.random() - 0.5) * 0.25);
+    thorn.rotateY((Math.random() - 0.5) * 0.18);
+
+    roseGroup.add(thorn);
+  }
 }
 
 function buildRealisticRosePetalsGeometry() {
-  const geos = [];
+  // Helper: positive modulo (JS % keeps sign, which causes spikes for negative theta)
+  const mod = (n, m) => ((n % m) + m) % m;
 
-  function createPetal(size, curvature) {
-    const petal = new THREE.PlaneGeometry(size * 0.24, size * 0.30, 8, 6);
-    const p = petal.attributes.position;
-    
-    for (let i = 0; i < p.count; i++) {
-      const x = p.getX(i);
-      const y = p.getY(i);
-      
-      const xNorm = x / (size * 0.24);
-      const yNorm = y / (size * 0.30);
-      const z = Math.pow(Math.abs(xNorm), 1.8) * curvature * 0.08 +
-                Math.pow(Math.abs(yNorm), 2.2) * curvature * 0.05;
-      
-      p.setZ(i, z);
+  const nu = 28;      // radial divisions
+  const nv = 320;     // angular divisions (576 is heavy and amplifies artifacts)
+  const positions = new Float32Array(nu * nv * 3);
+  const indices = new Uint32Array((nu - 1) * (nv - 1) * 6);
+
+  const TWO_PI = Math.PI * 2;
+
+  let v = 0;
+  for (let i = 0; i < nu; i++) {
+    const x = i / (nu - 1);
+
+    for (let j = 0; j < nv; j++) {
+      // Keep your same theta span, but computed cleanly
+      const theta = -TWO_PI + (j / (nv - 1)) * (17 * Math.PI);
+
+      const phi = (Math.PI / 2) * Math.exp(-theta / (8 * Math.PI));
+
+      // FIX: safe modulo so the term is consistent for negative theta
+      const t = mod(3.6 * theta, TWO_PI) / Math.PI; // 0..2
+      const inner = 1 - (t);                        // similar structure to your original
+
+      // Original shape term, but stabilized
+      let X =
+        1 - 0.5 * Math.pow(
+          (5 / 4) * (1 - Math.pow(inner, 2)) - 0.25,
+          2
+        );
+
+      // Clamp X so it can't create runaway geometry
+      X = THREE.MathUtils.clamp(X, 0.05, 1.35);
+
+      const y = 1.95653 * (x ** 2) * ((1.27689 * x - 1) ** 2) * Math.sin(phi);
+
+      let r = X * (x * Math.sin(phi) + y * Math.cos(phi));
+      let h = X * (x * Math.cos(phi) - y * Math.sin(phi));
+
+      // Avoid degeneracy on the axis (r ~ 0 creates long skinny triangles)
+      const eps = 0.002;
+      if (!Number.isFinite(r) || !Number.isFinite(h)) {
+        r = eps;
+        h = 0;
+      } else if (r < eps) {
+        r = eps;
+      }
+
+      // Size + placement tuning
+      const scale = 0.30;
+      r *= scale;
+      h *= scale;
+
+      const px = r * Math.sin(theta);
+      const py = h + 0.62; // aligns closer to stem top (stem top is ~0.65)
+      const pz = r * Math.cos(theta);
+
+      const base = v * 3;
+      positions[base] = px;
+      positions[base + 1] = py;
+      positions[base + 2] = pz;
+
+      v++;
     }
-    p.needsUpdate = true;
-    
-    return petal;
   }
 
-  const bloomCenter = new THREE.Vector3(0, 0.68, 0);
+  // Indices (two triangles per quad)
+  let k = 0;
+  for (let i = 0; i < nu - 1; i++) {
+    for (let j = 0; j < nv - 1; j++) {
+      const a = i * nv + j;
+      const b = (i + 1) * nv + j;
+      const c = (i + 1) * nv + (j + 1);
+      const d = i * nv + (j + 1);
 
-  const outerCount = 14;
-  for (let i = 0; i < outerCount; i++) {
-    const angle = (i / outerCount) * Math.PI * 2;
-    const g = createPetal(1.0, 1.0);
-
-    const spread = 0.12;
-    g.rotateY(angle);
-    g.rotateX(-0.75);
-    g.translate(
-      bloomCenter.x + Math.cos(angle) * spread,
-      bloomCenter.y - 0.02,
-      bloomCenter.z + Math.sin(angle) * spread
-    );
-
-    geos.push(g);
+      indices[k++] = a; indices[k++] = b; indices[k++] = d;
+      indices[k++] = b; indices[k++] = c; indices[k++] = d;
+    }
   }
 
-  const midOuterCount = 11;
-  for (let i = 0; i < midOuterCount; i++) {
-    const angle = (i / midOuterCount) * Math.PI * 2 + 0.15;
-    const g = createPetal(0.88, 1.1);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geo.setIndex(new THREE.BufferAttribute(indices, 1));
+  geo.computeVertexNormals();
+  geo.computeBoundingSphere();
 
-    const spread = 0.09;
-    g.rotateY(angle);
-    g.rotateX(-0.95);
-    g.translate(
-      bloomCenter.x + Math.cos(angle) * spread,
-      bloomCenter.y + 0.01,
-      bloomCenter.z + Math.sin(angle) * spread
-    );
-
-    geos.push(g);
-  }
-
-  const midCount = 9;
-  for (let i = 0; i < midCount; i++) {
-    const angle = (i / midCount) * Math.PI * 2 + 0.28;
-    const g = createPetal(0.75, 1.25);
-
-    const spread = 0.065;
-    g.rotateY(angle);
-    g.rotateX(-1.15);
-    g.translate(
-      bloomCenter.x + Math.cos(angle) * spread,
-      bloomCenter.y + 0.04,
-      bloomCenter.z + Math.sin(angle) * spread
-    );
-
-    geos.push(g);
-  }
-
-  const innerCount = 7;
-  for (let i = 0; i < innerCount; i++) {
-    const angle = (i / innerCount) * Math.PI * 2 + 0.35;
-    const g = createPetal(0.62, 1.4);
-
-    const spread = 0.042;
-    g.rotateY(angle);
-    g.rotateX(-1.35);
-    g.translate(
-      bloomCenter.x + Math.cos(angle) * spread,
-      bloomCenter.y + 0.065,
-      bloomCenter.z + Math.sin(angle) * spread
-    );
-
-    geos.push(g);
-  }
-
-  const budCount = 5;
-  for (let i = 0; i < budCount; i++) {
-    const angle = (i / budCount) * Math.PI * 2 + 0.5;
-    const g = createPetal(0.45, 1.6);
-
-    const spread = 0.022;
-    g.rotateY(angle);
-    g.rotateX(-1.55);
-    g.translate(
-      bloomCenter.x + Math.cos(angle) * spread,
-      bloomCenter.y + 0.085,
-      bloomCenter.z + Math.sin(angle) * spread
-    );
-
-    geos.push(g);
-  }
-
-  const core = new THREE.SphereGeometry(0.035, 12, 10);
-  core.translate(bloomCenter.x, bloomCenter.y + 0.095, bloomCenter.z);
-  geos.push(core);
-
-  const merged = mergeGeometries(geos, false);
-  merged.computeVertexNormals();
-  return merged;
+  return geo;
 }
 
 // --------------------
@@ -1009,7 +1330,6 @@ function onRoseTapped() {
   hintEl?.classList?.add('hide');
   cardEl?.classList?.add('show');
 
-  rose.pop();
   playChime();
 }
 
@@ -1063,6 +1383,7 @@ function playChime() {
 // --------------------
 function animate() {
   requestAnimationFrame(animate);
+  const delta = clock.getDelta();
   const t = clock.getElapsedTime();
   
   if (CONFIG.enableWind && flowerField) {
@@ -1071,6 +1392,10 @@ function animate() {
 
   if (rose) {
     rose.animateRose(t);
+  }
+
+  if (fallingHearts) {
+    fallingHearts.update(delta, t);
   }
 
   if (!controls) camera.lookAt(CONFIG.lookAt);
